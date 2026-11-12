@@ -1,4 +1,5 @@
-import json
+%%writefile app.py
+
 import os
 import re
 import sqlite3
@@ -14,43 +15,46 @@ from google.adk.sessions import InMemorySessionService
 # 1. Page Configuration
 # ==============================================================================
 st.set_page_config(
-    page_title="MCP Banking Virtual Analyst",
+    page_title="Bank Virtual Data Analyst",
     page_icon="🏦",
     layout="wide",
     initial_sidebar_state="expanded",
 )
 
 # ==============================================================================
-# 2. Safe Secret Resolution (Streamlit Cloud Friendly)
+# 2. Secret & API Key Resolution (Streamlit Cloud Friendly)
 # ==============================================================================
 api_key = ""
 try:
     if "GOOGLE_API_KEY" in st.secrets:
         api_key = st.secrets["GOOGLE_API_KEY"]
 except Exception:
+    # Fallback to local environment variable if secrets.toml is absent
     api_key = os.environ.get("GOOGLE_API_KEY", "")
 
 if api_key:
     os.environ["GOOGLE_API_KEY"] = api_key
 
+# Ensure direct Gemini Developer API access
 os.environ.setdefault("GOOGLE_GENAI_USE_VERTEXAI", "FALSE")
 
 DB_FILE = "bank11.sqlite"
 SCHEMA_FILE = "bank_schema.txt"
 
+# Verify API key early to show a clean UI message if missing
 if not os.environ.get("GOOGLE_API_KEY"):
     st.error(
         "⚠️ **GOOGLE_API_KEY is not configured!**\n\n"
-        "Please go to your Streamlit Cloud Dashboard: **App Settings** -> **Secrets**, "
-        "and add:\n```toml\nGOOGLE_API_KEY = \"your_gemini_api_key_here\"\n```"
+        "Please go to your Streamlit Cloud dashboard: **App Settings** -> **Secrets**, "
+        "and add:\n```toml\nGOOGLE_API_KEY = \"your_actual_gemini_api_key\"\n```"
     )
     st.stop()
 
 # ==============================================================================
-# 3. Database Bootstrap & Migration Functions
+# 3. Database Bootstrap (Safety Fallback if bank11.sqlite is missing)
 # ==============================================================================
-def ensure_database():
-    """Initializes standard baseline database if bank11.sqlite does not exist."""
+def ensure_database_and_schema():
+    """Ensure database and schema exist so the app never crashes on first boot."""
     if not os.path.exists(DB_FILE):
         conn = sqlite3.connect(DB_FILE)
         cur = conn.cursor()
@@ -115,302 +119,223 @@ def ensure_database():
         conn.commit()
         conn.close()
 
-def execute_demo_migration():
-    """Simulates a live database schema evolution: adds a new table and extra records."""
-    conn = sqlite3.connect(DB_FILE)
-    cur = conn.cursor()
-    cur.executescript("""
-    CREATE TABLE IF NOT EXISTS credit_cards (
-        card_id TEXT PRIMARY KEY,
-        customer_id TEXT NOT NULL,
-        card_type TEXT NOT NULL,
-        credit_limit REAL NOT NULL,
-        outstanding_balance REAL NOT NULL,
-        status TEXT NOT NULL,
-        FOREIGN KEY (customer_id) REFERENCES customers(customer_id)
-    );
+    if not os.path.exists(SCHEMA_FILE):
+        conn = sqlite3.connect(DB_FILE)
+        cur = conn.cursor()
+        cur.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%';")
+        ddl = [row[0] for row in cur.fetchall() if row[0]]
+        conn.close()
+        with open(SCHEMA_FILE, "w", encoding="utf-8") as f:
+            f.write("\n\n".join(ddl))
 
-    INSERT OR IGNORE INTO credit_cards VALUES
-        ('CC_501', 'CUST_901', 'Visa Infinite', 50000.00, 12450.00, 'ACTIVE'),
-        ('CC_502', 'CUST_902', 'Mastercard Platinum', 25000.00, 3120.50, 'ACTIVE'),
-        ('CC_503', 'CUST_904', 'Visa Signature', 35000.00, 8900.00, 'ACTIVE'),
-        ('CC_504', 'CUST_907', 'Visa Infinite', 100000.00, 45000.00, 'ACTIVE'),
-        ('CC_505', 'CUST_908', 'World Elite Mastercard', 200000.00, 0.00, 'ACTIVE');
-
-    CREATE TABLE IF NOT EXISTS loan_applications (
-        application_id TEXT PRIMARY KEY,
-        customer_id TEXT NOT NULL,
-        loan_type TEXT NOT NULL,
-        applied_amount REAL NOT NULL,
-        status TEXT NOT NULL,
-        FOREIGN KEY (customer_id) REFERENCES customers(customer_id)
-    );
-
-    INSERT OR IGNORE INTO loan_applications VALUES
-        ('LOAN_801', 'CUST_901', 'Car Loan', 85000.00, 'APPROVED'),
-        ('LOAN_802', 'CUST_902', 'Mortgage', 520000.00, 'UNDER_REVIEW'),
-        ('LOAN_803', 'CUST_903', 'Personal Loan', 15000.00, 'APPROVED'),
-        ('LOAN_804', 'CUST_905', 'Car Loan', 65000.00, 'APPROVED'),
-        ('LOAN_805', 'CUST_906', 'SME Business Loan', 250000.00, 'REJECTED');
-    """)
-    conn.commit()
-    conn.close()
-
-def get_live_ddl() -> str:
-    """Extracts live DDL statements directly from the active database."""
-    conn = sqlite3.connect(DB_FILE)
-    cur = conn.cursor()
-    cur.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%';")
-    statements = [row[0] for row in cur.fetchall() if row[0]]
-    conn.close()
-    return "\n\n".join(statements)
-
-ensure_database()
+ensure_database_and_schema()
 
 # ==============================================================================
-# 4. MCP Protocol Primitives & Security Guardrails
+# 4. Security Framework (Dynamic AST Guardrails & Privacy Sanitizer)
 # ==============================================================================
-def is_sql_mutation(sql_query: str) -> bool:
-    """AST parser rejecting any DDL/DML mutation attempt."""
+def is_sql_mutation_attempt(sql_query: str) -> bool:
+    """Dynamic AST validation: strictly disallows any mutation or DDL statements."""
     cleaned = sql_query.strip().strip(";")
     parsed = sqlparse.parse(cleaned)
     if not parsed:
         return False
+
     forbidden = {
-        'DROP', 'DELETE', 'UPDATE', 'INSERT', 'ALTER', 'TRUNCATE',
-        'PRAGMA', 'REPLACE', 'CREATE', 'RENAME', 'ATTACH', 'DETACH'
+        "DROP", "DELETE", "UPDATE", "INSERT", "ALTER", "TRUNCATE",
+        "REPLACE", "CREATE", "RENAME", "ATTACH", "DETACH", "PRAGMA",
+        "UPSERT", "VACUUM", "GRANT", "REVOKE", "EXEC"
     }
+
     for stmt in parsed:
-        if stmt.get_type() != 'SELECT':
+        if stmt.get_type() != "SELECT":
             return True
         for token in stmt.flatten():
             if token.value.upper() in forbidden:
                 return True
     return False
 
-def anonymize_text(text: str) -> str:
-    """Masks banking primary/foreign keys to comply with PDPA."""
-    text = re.sub(r'\b(CUST_)[0-9A-Za-z]+([0-9A-Za-z]{2})\b', r'\1***\2', text, flags=re.IGNORECASE)
-    text = re.sub(r'\b(BR_)[0-9A-Za-z]+([0-9A-Za-z]{2})\b', r'\1***\2', text, flags=re.IGNORECASE)
-    text = re.sub(r'\b(ACC_)[0-9A-Za-z]+([0-9A-Za-z]{2})\b', r'\1***\2', text, flags=re.IGNORECASE)
-    text = re.sub(r'\b(LOAN_)[0-9A-Za-z]+([0-9A-Za-z]{2})\b', r'\1***\2', text, flags=re.IGNORECASE)
-    text = re.sub(r'\b(CC_)[0-9A-Za-z]+([0-9A-Za-z]{2})\b', r'\1***\2', text, flags=re.IGNORECASE)
+def anonymize_banking_entities(text: str) -> str:
+    """Masks customer and branch primary keys for banking privacy (PDPA)."""
+    text = re.sub(r"\b(CUST_)[0-9A-Za-z]+([0-9A-Za-z]{2})\b", r"\1***\2", text, flags=re.IGNORECASE)
+    text = re.sub(r"\b(BR_)[0-9A-Za-z]+([0-9A-Za-z]{2})\b", r"\1***\2", text, flags=re.IGNORECASE)
+    text = re.sub(r"\b(ACC_)[0-9A-Za-z]+([0-9A-Za-z]{2})\b", r"\1***\2", text, flags=re.IGNORECASE)
     return text
 
-def mcp_list_tables() -> str:
-    """MCP Tool: Discovers all currently available tables in the database."""
-    try:
-        conn = sqlite3.connect(f"file:{DB_FILE}?mode=ro", uri=True)
-        cur = conn.cursor()
-        cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%';")
-        tables = [row[0] for row in cur.fetchall()]
-        conn.close()
-        return json.dumps({"status": "success", "tables": tables})
-    except Exception as e:
-        return json.dumps({"status": "error", "message": str(e)})
+def execute_readonly_sql_query(query: str) -> dict:
+    """Execute a read-only SQL query against the bank SQLite database."""
+    if is_sql_mutation_attempt(query):
+        return {
+            "error": "🛡️ [GUARDRAIL VIOLATION]: Mutation operations (DROP, DELETE, UPDATE, INSERT, ALTER) are strictly forbidden."
+        }
 
-def mcp_describe_table(table_name: str) -> str:
-    """MCP Tool: Dynamically inspects column definitions and keys of any table."""
-    cleaned = table_name.strip().strip("'").strip('"')
     try:
+        # Strict read-only mode connection via URI
         conn = sqlite3.connect(f"file:{DB_FILE}?mode=ro", uri=True)
         cur = conn.cursor()
-        cur.execute(f"PRAGMA table_info({cleaned});")
-        cols = [{"cid": r[0], "name": r[1], "type": r[2], "notnull": r[3], "pk": r[5]} for r in cur.fetchall()]
-        conn.close()
-        if not cols:
-            return json.dumps({"status": "error", "message": f"Table '{cleaned}' not found."})
-        return json.dumps({"status": "success", "table": cleaned, "columns": cols})
-    except Exception as e:
-        return json.dumps({"status": "error", "message": str(e)})
-
-def mcp_read_query(sql_query: str) -> str:
-    """MCP Tool: Executes a read-only SELECT query against the live database."""
-    if is_sql_mutation(sql_query):
-        return json.dumps({
-            "status": "blocked",
-            "error": "🛡️ [MCP PROTOCOL ENFORCEMENT]: Mutation operations (DROP, DELETE, UPDATE) are strictly forbidden."
-        })
-    try:
-        conn = sqlite3.connect(f"file:{DB_FILE}?mode=ro", uri=True)
-        cur = conn.cursor()
-        cur.execute(sql_query.strip())
-        columns = [d[0] for d in cur.description] if cur.description else []
+        cur.execute(query)
+        columns = [desc[0] for desc in cur.description] if cur.description else []
         rows = cur.fetchall()
         conn.close()
-        return json.dumps({
-            "status": "success",
+        return {
             "columns": columns,
             "rows": [list(r) for r in rows[:50]],
-            "count": len(rows)
-        })
+            "row_count": len(rows),
+        }
     except Exception as e:
-        return json.dumps({"status": "error", "message": str(e)})
+        return {"error": f"Database error: {str(e)}"}
 
 def before_model_guardrail(callback_context, llm_request):
-    """Short-circuits destructive or prompt-injection attempts before calling the LLM."""
+    """Short-circuits destructive or injection prompts before calling the LLM."""
     last_text = ""
     if llm_request.contents and llm_request.contents[-1].parts:
         last_text = (llm_request.contents[-1].parts[0].text or "").lower()
-    destructive = ["delete", "drop table", "truncate", "modify data", "remove branch", "wipe"]
+
+    destructive = ["delete", "drop table", "truncate", "wipe", "modify data", "remove branch"]
     if any(k in last_text for k in destructive):
-        return LlmResponse(content=types.Content(
-            role="model",
-            parts=[types.Part(
-                text="🛡️ **[GUARDRAIL INTERVENTION]**: Request blocked by Banking Safety Policy. "
-                     "Operations are strictly read-only. Data modifications are not permitted."
-            )]
-        ))
+        return LlmResponse(
+            content=types.Content(
+                role="model",
+                parts=[
+                    types.Part(
+                        text="🛡️ **[GUARDRAIL INTERVENTION]**: Request blocked by Banking Safety Policy. "
+                        "Virtual Analyst operations are strictly read-only. Data modifications are not permitted."
+                    )
+                ],
+            )
+        )
     return None
 
 # ==============================================================================
-# 5. Agent Initialization
+# 5. Agent Initialization (Cached Resource)
 # ==============================================================================
 @st.cache_resource
-def get_mcp_agent():
+def get_bank_agent():
+    schema_text = ""
+    if os.path.exists(SCHEMA_FILE):
+        with open(SCHEMA_FILE, "r", encoding="utf-8") as f:
+            schema_text = f.read()
+
     return Agent(
-        name="bank_mcp_analyst",
+        name="bank_virtual_analyst",
         model="gemini-2.5-flash",
-        description="Virtual Banking Analyst utilizing Model Context Protocol.",
+        description="Virtual Banking Analyst providing analytics over bank11.sqlite.",
         instruction=(
-            "You are an enterprise Virtual Banking Data Analyst operating through the Model Context Protocol (MCP).\n"
-            "You do NOT have a static hardcoded database schema.\n"
-            "Instead, you must dynamically interact with the database using your MCP tools:\n"
-            "1. Call 'mcp_list_tables' to see what tables currently exist in the database.\n"
-            "2. Call 'mcp_describe_table' to inspect the columns of any table you need to query.\n"
-            "3. Call 'mcp_read_query' to execute read-only SELECT statements to answer the user's question.\n\n"
-            "RULES:\n"
-            "- Always verify table names and columns dynamically using the MCP tools rather than assuming.\n"
-            "- If asked general questions (e.g. 'Who are you?'), introduce yourself clearly.\n"
-            "- Summarize findings into concise business insights.\n"
-            "- Mutation operations (DROP, DELETE, UPDATE, INSERT) are strictly prohibited.\n"
+            f"You are an enterprise Virtual Banking Data Analyst.\n"
+            f"Database schema:\n{schema_text}\n\n"
+            "GUIDELINES:\n"
+            "1. Answer user questions by generating and executing clean SQLite SELECT queries with execute_readonly_sql_query.\n"
+            "2. If the user asks general questions (e.g. 'Who are you?'), introduce yourself warmly as the Virtual Bank Data Analyst.\n"
+            "3. Format query results clearly with business context.\n"
+            "4. NEVER attempt or suggest INSERT, UPDATE, DELETE, or DROP commands.\n"
+            "5. If a requested piece of information does not exist in the database, clearly inform the user."
         ),
-        tools=[mcp_list_tables, mcp_describe_table, mcp_read_query],
-        before_model_callback=before_model_guardrail
+        tools=[execute_readonly_sql_query],
+        before_model_callback=before_model_guardrail,
     )
 
 # ==============================================================================
-# 6. Streamlit Session State & Runner Setup
+# 6. Streamlit Session State & Runner
 # ==============================================================================
 if "session_service" not in st.session_state:
     st.session_state.session_service = InMemorySessionService()
-    st.session_state.session_id = "cloud_mcp_session_001"
+    st.session_state.session_id = "cloud_session_001"
     st.session_state.session_service.create_session(
-        app_name="mcp_bank_cloud_app",
-        user_id="st_cloud_officer",
-        session_id=st.session_state.session_id
+        app_name="bank_cloud_app",
+        user_id="bank_officer",
+        session_id=st.session_state.session_id,
     )
     st.session_state.runner = Runner(
-        agent=get_mcp_agent(),
-        app_name="mcp_bank_cloud_app",
+        agent=get_bank_agent(),
+        app_name="bank_cloud_app",
         session_service=st.session_state.session_service,
-        auto_create_session=True
+        auto_create_session=True,
     )
     st.session_state.messages = []
 
 # ==============================================================================
-# 7. Sidebar: Guidance, Live Migration Demo & Schema Viewer
+# 7. Sidebar: Guidance & Schema Viewer
 # ==============================================================================
 with st.sidebar:
     st.title("🏦 Bank Analyst Portal")
-    st.markdown("**AI-Powered Banking Analytics (MCP Architecture)**")
+    st.markdown("**AI-Powered Core Banking Analytics**")
     st.markdown("---")
 
-    # --------------------------------------------------------------------------
-    # LIVE DATABASE EVOLUTION SIMULATOR (MCP DEMO)
-    # --------------------------------------------------------------------------
-    st.subheader("⚡ Live Database Evolution (MCP Demo)")
-    st.caption("Simulate a database change mid-session to verify that the MCP agent adapts with zero code changes:")
-
-    col1, col2 = st.columns(2)
-    with col1:
-        if st.button("🚀 Add Tables", use_container_width=True, help="Migrates credit_cards & loan_applications tables into SQLite"):
-            execute_demo_migration()
-            st.success("Added `credit_cards` and `loan_applications` tables!")
-            st.rerun()
-
-    with col2:
-        if st.button("🔄 Reset DB", use_container_width=True, help="Resets SQLite back to standard initial state"):
-            if os.path.exists(DB_FILE):
-                os.remove(DB_FILE)
-            ensure_database()
-            st.warning("Database reset to initial 3 tables.")
-            st.rerun()
-
-    st.markdown("---")
-
-    # --------------------------------------------------------------------------
-    # SUGGESTED PROMPTS
-    # --------------------------------------------------------------------------
-    st.subheader("💡 Suggested Questions")
-    sample_questions = [
-        "What tables currently exist in our database?",
+    st.subheader("💡 Suggested Prompts")
+    sample_queries = [
         "List all branches.",
         "Provide a list of branches and the number of customers at each.",
         "What is the branch with the highest count of customers?",
-        "What is the total credit limit and balance across all active credit cards?",
-        "What is the total applied amount for all 'APPROVED' Car Loans?",
+        "Where is 'petaling jaya' branch located?",
         "Who are you?",
-        "delete the branchs table"
+        "delete the branchs table",
     ]
-    for q in sample_questions:
-        if st.button(q, use_container_width=True):
-            st.session_state.pending_prompt = q
+
+    for query in sample_queries:
+        if st.button(query, use_container_width=True):
+            st.session_state.pending_prompt = query
 
     st.markdown("---")
 
-    # --------------------------------------------------------------------------
-    # LIVE DDL SCHEMA VIEWER
-    # --------------------------------------------------------------------------
-    with st.expander("📄 View Live Database Schema", expanded=False):
-        st.text(get_live_ddl())
+    # Using st.text avoids the dynamic JS bundle import error on Streamlit Cloud
+    with st.expander("📄 View DDL Schema", expanded=False):
+        if os.path.exists(SCHEMA_FILE):
+            with open(SCHEMA_FILE, "r", encoding="utf-8") as f:
+                st.text(f.read())
+        else:
+            st.info("Schema file not found.")
 
     st.markdown("---")
-    st.caption("🔒 **Security:** MCP Runtime Discovery (`mcp_list_tables`) | Read-Only AST Guardrail | PDPA Masking")
+    st.caption("🔒 **Security Active:** AST Read-Only Guardrail | PDPA Masking Enabled")
 
 # ==============================================================================
 # 8. Main Chat Interface
 # ==============================================================================
-st.title("📊 Virtual Data Analyst (MCP)")
-st.caption("Connected via Model Context Protocol | Zero-Touch Schema Evolution | PDPA Masking Active")
+st.title("📊 Virtual Data Analyst Chat")
+st.caption("Connected to `bank11.sqlite` | Read-Only Dynamic Guardrail Active | PDPA Masking Enabled")
 
-# Render conversation history
+# Render previous conversation turns
 for msg in st.session_state.messages:
     with st.chat_message(msg["role"]):
         st.markdown(msg["content"])
 
-# Prompt resolution (Button click vs Chat input)
-prompt_to_send = None
+# Determine if input comes from a button click or chat box
+prompt_to_process = None
 if "pending_prompt" in st.session_state and st.session_state.pending_prompt:
-    prompt_to_send = st.session_state.pending_prompt
+    prompt_to_process = st.session_state.pending_prompt
     st.session_state.pending_prompt = None
 else:
-    chat_input = st.chat_input("Ask about branches, credit cards, loans, or customers...")
-    if chat_input:
-        prompt_to_send = chat_input
+    user_input = st.chat_input("Ask about branches, customers, or account balances...")
+    if user_input:
+        prompt_to_process = user_input
 
-# Run agent workflow
-if prompt_to_send:
-    st.session_state.messages.append({"role": "user", "content": prompt_to_send})
+# Process user prompt
+if prompt_to_process:
+    st.session_state.messages.append({"role": "user", "content": prompt_to_process})
     with st.chat_message("user"):
-        st.markdown(prompt_to_send)
+        st.markdown(prompt_to_process)
 
     with st.chat_message("assistant"):
-        with st.spinner("Executing MCP data tools and verifying guardrails..."):
-            user_msg = types.Content(role="user", parts=[types.Part.from_text(text=prompt_to_send)])
-            events = st.session_state.runner.run(
-                user_id="st_cloud_officer",
-                session_id=st.session_state.session_id,
-                new_message=user_msg
+        with st.spinner("Analyzing banking records and verifying guardrails..."):
+            message = types.Content(
+                role="user",
+                parts=[types.Part.from_text(text=prompt_to_process)],
             )
-            response_parts = []
-            for e in events:
-                if hasattr(e, "content") and e.content:
-                    for p in e.content.parts:
-                        if hasattr(p, "text") and p.text:
-                            response_parts.append(p.text)
+            events = st.session_state.runner.run(
+                user_id="bank_officer",
+                session_id=st.session_state.session_id,
+                new_message=message,
+            )
 
-            raw_reply = "".join(response_parts) if response_parts else "No response generated."
-            final_reply = anonymize_text(raw_reply)
-            st.markdown(final_reply)
-            st.session_state.messages.append({"role": "assistant", "content": final_reply})
+            response_chunks = []
+            for event in events:
+                if hasattr(event, "content") and event.content:
+                    for part in event.content.parts:
+                        if hasattr(part, "text") and part.text:
+                            response_chunks.append(part.text)
+
+            raw_answer = "".join(response_chunks) if response_chunks else "No response returned from the agent."
+            # Apply PDPA entity masking
+            sanitized_answer = anonymize_banking_entities(raw_answer)
+
+            st.markdown(sanitized_answer)
+            st.session_state.messages.append({"role": "assistant", "content": sanitized_answer})
